@@ -13,17 +13,30 @@ public class DefaultAsyncObjectPool<T> implements AsyncObjectPool<T> {
     private final OrderedEventExecutor eventExecutor;
     private final PooledObjectLifecycleManager<T> lifecycleManager;
 
-    private final Set<T> allObjects = new HashSet<T>();
-    private final Deque<T> idlePooledObjects = new ArrayDeque<T>();
+    private final int capacity;
+
+    private final Set<T> allObjects;
+    private final Deque<T> idlePooledObjects;
+
+    private final Deque<Promise<T>> pendingAcquisitions = new ArrayDeque<Promise<T>>();
 
     // We don't just rely on allObjects.size() for this because we may have objects that are still in the process of
     // being created.
-    private int pooledObjectCount = 0;
+    private int totalObjectCount = 0;
 
     private static final NoSuchElementException NOT_IN_POOL_EXCEPTION =
             new NoSuchElementException("Released object not in object pool");
 
-    public DefaultAsyncObjectPool(final OrderedEventExecutor eventExecutor, final PooledObjectLifecycleManager<T> lifecycleManager) {
+    public DefaultAsyncObjectPool(final OrderedEventExecutor eventExecutor, final PooledObjectLifecycleManager<T> lifecycleManager, final int capacity) {
+        if (capacity < 1) {
+            throw new IllegalArgumentException("Capacity must be positive");
+        }
+
+        this.capacity = capacity;
+
+        this.allObjects = new HashSet<T>(capacity);
+        this.idlePooledObjects = new ArrayDeque<T>(capacity);
+
         this.eventExecutor = eventExecutor;
         this.lifecycleManager = lifecycleManager;
     }
@@ -57,23 +70,27 @@ public class DefaultAsyncObjectPool<T> implements AsyncObjectPool<T> {
             if (objectFromIdlePool != null) {
                 activateObjectForAcquisition(objectFromIdlePool, false, promise);
             } else {
-                pooledObjectCount++;
+                if (totalObjectCount < capacity) {
+                    totalObjectCount++;
 
-                lifecycleManager.createObject(eventExecutor.<T>newPromise()).addListener(new GenericFutureListener<Future<T>>() {
+                    lifecycleManager.createObject(eventExecutor.<T>newPromise()).addListener(new GenericFutureListener<Future<T>>() {
 
-                    @Override
-                    public void operationComplete(final Future<T> createFuture) throws Exception {
-                        if (createFuture.isSuccess()) {
-                            final T createdObject = createFuture.getNow();
+                        @Override
+                        public void operationComplete(final Future<T> createFuture) throws Exception {
+                            if (createFuture.isSuccess()) {
+                                final T createdObject = createFuture.getNow();
 
-                            allObjects.add(createdObject);
-                            activateObjectForAcquisition(createdObject, true, promise);
-                        } else {
-                            // We failed to create a new object and should fail the whole acquisition attempt
-                            promise.tryFailure(createFuture.cause());
+                                allObjects.add(createdObject);
+                                activateObjectForAcquisition(createdObject, true, promise);
+                            } else {
+                                // We failed to create a new object and should fail the whole acquisition attempt
+                                promise.tryFailure(createFuture.cause());
+                            }
                         }
-                    }
-                });
+                    });
+                } else {
+                    pendingAcquisitions.addLast(promise);
+                }
             }
         }
     }
@@ -208,17 +225,29 @@ public class DefaultAsyncObjectPool<T> implements AsyncObjectPool<T> {
     }
 
     private void returnDeactivatedObjectToPool(T object) {
+        assert eventExecutor.inEventLoop();
+
         idlePooledObjects.addLast(object);
+        triggerNextPendingAcquisition();
     }
 
     private void destroyObject(final T object) {
         assert eventExecutor.inEventLoop();
-        assert pooledObjectCount > 0;
+        assert totalObjectCount > 0;
 
         allObjects.remove(object);
-        pooledObjectCount--;
+        totalObjectCount--;
 
         lifecycleManager.destroyObject(object, eventExecutor.<Void>newPromise());
+        triggerNextPendingAcquisition();
+    }
+
+    private void triggerNextPendingAcquisition() {
+        final Promise<T> pendingAcquisition = pendingAcquisitions.pollFirst();
+
+        if (pendingAcquisition != null) {
+            acquireObject(pendingAcquisition);
+        }
     }
 
     @Override
@@ -233,12 +262,12 @@ public class DefaultAsyncObjectPool<T> implements AsyncObjectPool<T> {
 
             @Override
             public int numTotalObjects() {
-                return pooledObjectCount;
+                return totalObjectCount;
             }
 
             @Override
             public int numWaitingToAcquire() {
-                return 0;
+                return pendingAcquisitions.size();
             }
         };
     }

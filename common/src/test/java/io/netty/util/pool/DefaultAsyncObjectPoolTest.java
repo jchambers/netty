@@ -1,8 +1,10 @@
 package io.netty.util.pool;
 
-import io.netty.util.concurrent.*;
+import io.netty.util.concurrent.DefaultEventExecutorGroup;
+import io.netty.util.concurrent.Future;
+import io.netty.util.concurrent.OrderedEventExecutor;
+import io.netty.util.concurrent.Promise;
 import org.junit.AfterClass;
-import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
@@ -11,8 +13,6 @@ import java.util.NoSuchElementException;
 import static org.junit.Assert.*;
 
 public class DefaultAsyncObjectPoolTest {
-
-    private DefaultAsyncObjectPool<Integer> pool;
 
     private static class PooledIntegerLifecycleManager implements PooledObjectLifecycleManager<Integer> {
 
@@ -56,12 +56,6 @@ public class DefaultAsyncObjectPoolTest {
         EXECUTOR_GROUP = new DefaultEventExecutorGroup(4);
     }
 
-    @Before
-    public void setUp() {
-        pool = new DefaultAsyncObjectPool<Integer>((OrderedEventExecutor) EXECUTOR_GROUP.next(),
-                new PooledIntegerLifecycleManager());
-    }
-
     @AfterClass
     public static void tearDownAfterClass() throws Exception {
         EXECUTOR_GROUP.shutdownGracefully().await();
@@ -69,6 +63,10 @@ public class DefaultAsyncObjectPoolTest {
 
     @Test
     public void testAcquire() throws Exception {
+        DefaultAsyncObjectPool<Integer> pool =
+                new DefaultAsyncObjectPool<Integer>((OrderedEventExecutor) EXECUTOR_GROUP.next(),
+                new PooledIntegerLifecycleManager(), 16);
+
         Integer first = pool.acquireObject().get();
 
         assertEquals(1, pool.metric().numTotalObjects());
@@ -87,9 +85,36 @@ public class DefaultAsyncObjectPoolTest {
     }
 
     @Test
+    public void testAcquireWithLimitedPoolSize() throws Exception {
+        DefaultAsyncObjectPool<Integer> pool = new DefaultAsyncObjectPool<Integer>(
+                (OrderedEventExecutor) EXECUTOR_GROUP.next(),
+                new PooledIntegerLifecycleManager(), 1);
+
+        final Integer objectFromPool = pool.acquireObject().get();
+
+        assertEquals(1, pool.metric().numTotalObjects());
+        assertEquals(0, pool.metric().numIdleObjects());
+        assertEquals(0, pool.metric().numWaitingToAcquire());
+
+        final Future<Integer> blockedAcquireFuture = pool.acquireObject();
+
+        assertEquals(1, pool.metric().numTotalObjects());
+        assertEquals(0, pool.metric().numIdleObjects());
+        assertEquals(1, pool.metric().numWaitingToAcquire());
+
+        assertTrue(pool.releaseObject(objectFromPool).await().isSuccess());
+        assertTrue(blockedAcquireFuture.await().isSuccess());
+
+        assertEquals(1, pool.metric().numTotalObjects());
+        assertEquals(0, pool.metric().numIdleObjects());
+        assertEquals(0, pool.metric().numWaitingToAcquire());
+    }
+
+    @Test
     public void testReleaseObjectNotFromPool() throws Exception {
         final OrderedEventExecutor executor = (OrderedEventExecutor) EXECUTOR_GROUP.next();
-        final DefaultAsyncObjectPool<Integer> pool = new DefaultAsyncObjectPool<Integer>(executor, new PooledIntegerLifecycleManager());
+        final DefaultAsyncObjectPool<Integer> pool =  new DefaultAsyncObjectPool<Integer>(
+                executor, new PooledIntegerLifecycleManager(), 16);
 
         final Future<Void> releaseFuture = pool.releaseObject(12).await();
 
